@@ -7,14 +7,17 @@
 #include "hardware/irq.h"
 #include "hardware/clocks.h"
 #include "hardware/i2c.h"
-#include "inc/ssd1306.h"  // Biblioteca SSD1306 (deve estar implementada)
+#include "inc/ssd1306.h"  // Assumindo biblioteca SSD1306 disponível
 
-// --- Configurações e constantes ---
 #define MIC_CHANNEL 2
 #define MIC_PIN 28
 #define BUTTON_A 5
 #define BUTTON_B 6
 #define BUZZER_PIN 21
+
+#define LED_GREEN 11
+#define LED_BLUE 12
+#define LED_RED 13
 
 #define ADC_CLOCK_DIV 2000
 #define ADC_SAMPLE_RATE (48000000 / ADC_CLOCK_DIV)
@@ -22,12 +25,12 @@
 #define TOTAL_SAMPLES (RECORD_TIME * ADC_SAMPLE_RATE)
 #define DMA_BLOCK_SIZE (ADC_SAMPLE_RATE / 4)
 
-#define PWM_WRAP 255
+#define PWM_WRAP 1023
 
 #define I2C_PORT i2c1
 #define I2C_SDA 14
 #define I2C_SCL 15
-#define SSD1306_I2C_FREQ 400000  // 400 kHz
+#define SSD1306_I2C_FREQ 100000
 
 uint8_t ssd[ssd1306_buffer_length];
 struct render_area frame_area = {
@@ -49,7 +52,6 @@ volatile bool playing = false;
 
 uint pwm_slice_num;
 
-// --- Protótipos ---
 void init_adc();
 void init_dma();
 void init_pwm_buzzer();
@@ -59,17 +61,18 @@ void stop_recording();
 void start_playback();
 void dma_handler();
 bool play_callback(struct repeating_timer *t);
-
 void oled_init();
-void draw_bar(uint8_t *buffer, int x, int height);
-void draw_bar_width(uint8_t *buffer, int x, int width, int height);
+void init_rgb();
+void set_led_recording();
+void set_led_playing();
+void set_led_off();
+void draw_column(uint8_t *buffer, int x, int height);
 void update_bars_display(uint16_t *samples, int num_samples);
 
 int main() {
     stdio_init_all();
-
+    init_rgb();
     oled_init();
-
     init_adc();
     init_dma();
     init_pwm_buzzer();
@@ -82,7 +85,6 @@ int main() {
                 start_recording();
                 sleep_ms(300);
             }
-
             if (!gpio_get(BUTTON_B)) {
                 printf("Iniciando reprodução\n");
                 start_playback();
@@ -98,12 +100,11 @@ int main() {
             if (num_samples > ssd1306_width) num_samples = ssd1306_width;
 
             update_bars_display(&buffer[start], num_samples);
-            blocks_ready = 0;  // Limpa flag para não desenhar o mesmo bloco várias vezes
+            blocks_ready = 0;
         }
 
         sleep_ms(100);
     }
-    return 0;
 }
 
 void init_adc() {
@@ -166,6 +167,8 @@ void start_recording() {
 
     adc_run(true);
     dma_channel_start(dma_chan);
+
+    set_led_recording();
 }
 
 void stop_recording() {
@@ -176,6 +179,8 @@ void stop_recording() {
 
     recording = false;
     printf("Gravação finalizada\n");
+
+    set_led_off();
 }
 
 void dma_handler() {
@@ -199,7 +204,9 @@ volatile int play_pos = 0;
 repeating_timer_t play_timer;
 
 void play_sample(uint16_t sample) {
-    uint16_t level = (uint16_t)((sample / 4095.0f) * PWM_WRAP);
+    float normalized = (float)sample / 4095.0f;
+    int level = (int)(normalized * PWM_WRAP * 1.5f);
+    if (level > PWM_WRAP) level = PWM_WRAP;
     pwm_set_gpio_level(BUZZER_PIN, level);
 }
 
@@ -207,9 +214,9 @@ bool play_callback(struct repeating_timer *t) {
     if (play_pos >= buffer_pos) {
         pwm_set_gpio_level(BUZZER_PIN, 0);
         playing = false;
+        set_led_off();
         return false;
     }
-
     play_sample(buffer[play_pos]);
     play_pos++;
     return true;
@@ -227,77 +234,90 @@ void start_playback() {
 
     int delay_us = 1000000 / ADC_SAMPLE_RATE;
     add_repeating_timer_us(-delay_us, play_callback, NULL, &play_timer);
+
+    set_led_playing();
 }
 
-// --------- OLED display ---------
+void init_rgb() {
+    gpio_init(LED_BLUE);
+    gpio_init(LED_GREEN);
+    gpio_init(LED_RED);
+    gpio_set_dir(LED_BLUE, GPIO_OUT);
+    gpio_set_dir(LED_GREEN, GPIO_OUT);
+    gpio_set_dir(LED_RED, GPIO_OUT);
+
+    gpio_put(LED_BLUE, 0);
+    gpio_put(LED_GREEN, 0);
+    gpio_put(LED_RED, 0);
+}
+
+void set_led_recording() {
+    gpio_put(LED_RED, 1);
+    gpio_put(LED_GREEN, 0);
+    gpio_put(LED_BLUE, 0);
+}
+
+void set_led_playing() {
+    gpio_put(LED_RED, 0);
+    gpio_put(LED_GREEN, 1);
+    gpio_put(LED_BLUE, 0);
+}
+
+void set_led_off() {
+    gpio_put(LED_RED, 0);
+    gpio_put(LED_GREEN, 0);
+    gpio_put(LED_BLUE, 0);
+}
+
 void oled_init() {
-    // Inicializa I2C no i2c1 (SDA=14, SCL=15)
     i2c_init(I2C_PORT, SSD1306_I2C_FREQ);
     gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA);
     gpio_pull_up(I2C_SCL);
 
-    ssd1306_init();  // Função da biblioteca SSD1306 para inicializar o display
-    
-    // Limpa o buffer e acende todos os pixels (tela cheia)
+    ssd1306_init();
+
     memset(ssd, 0xFF, ssd1306_buffer_length);
     render_on_display(ssd, &frame_area);
 
-    // Após isso limpa a tela para ficar preta no início
     memset(ssd, 0x00, ssd1306_buffer_length);
     render_on_display(ssd, &frame_area);
 }
 
-/// Desenha uma barra vertical em coluna 'x' com altura 'height' (pixels)
-void draw_bar(uint8_t *buffer, int x, int height) {
-    // Para cada página vertical (0 a 7, pois 64/8 = 8 páginas)
-    for (int page = 0; page < 8; page++) {
-        uint8_t byte = 0x00;
-
-        // Para cada bit do byte (cada linha da página)
+void draw_column(uint8_t *buffer, int x, int height) {
+    for (int page = 0; page < ssd1306_n_pages; page++) {
+        uint8_t byte = 0;
         for (int bit = 0; bit < 8; bit++) {
-            int y = page * 8 + bit;  // Posição vertical do pixel
-
-            // Se o pixel está dentro da altura da barra, acende o bit
-            if (y >= 64 - height) {
+            int y = page * 8 + bit;
+            if (y >= (ssd1306_height - height)) {
                 byte |= (1 << bit);
             }
         }
-        buffer[page * ssd1306_width + x] = byte;  // Define o byte completo da página na coluna x
+        buffer[page * ssd1306_width + x] = byte;
     }
 }
 
-// Desenha uma barra com largura 'width', chamando draw_bar para cada coluna
-void draw_bar_width(uint8_t *buffer, int x, int width, int height) {
-    for (int w = 0; w < width; w++) {
-        if (x + w < ssd1306_width) {
-            draw_bar(buffer, x + w, height);
-        }
-    }
-}
-
-// Atualiza o display desenhando barras para os samples de áudio
 void update_bars_display(uint16_t *samples, int num_samples) {
-    memset(ssd, 0x00, ssd1306_buffer_length);  // Limpa o buffer
+    memset(ssd, 0x00, ssd1306_buffer_length);
 
-    int bar_width = 2;
-    int spacing = 1;
-    int step = bar_width + spacing;
-    int num_bars = ssd1306_width / step;
+    int samples_per_col = num_samples / ssd1306_width;
+    if (samples_per_col == 0) samples_per_col = 1;
 
-    for (int i = 0; i < num_bars && i < num_samples; i++) {
-        uint16_t sample = samples[i];
-        // Centraliza o sample em zero, magnitude absoluta para altura
-        int32_t centered = (int32_t)sample - 2048;
-        int32_t magnitude = centered < 0 ? -centered : centered;
+    for (int x = 0; x < ssd1306_width; x++) {
+        int32_t sum = 0;
+        for (int j = 0; j < samples_per_col; j++) {
+            int index = x * samples_per_col + j;
+            if (index < num_samples) {
+                int32_t centered = samples[index] - 2048;
+                sum += abs(centered);
+            }
+        }
+        int avg = sum / samples_per_col;
+        int height = avg * ssd1306_height / 2048;
+        if (height > ssd1306_height) height = ssd1306_height;
 
-        int height = (magnitude * 64) / 2048;
-        if (height > 64) height = 64;
-
-        int x = i * step;
-
-        draw_bar_width(ssd, x, bar_width, height);
+        draw_column(ssd, x, height);
     }
 
     render_on_display(ssd, &frame_area);
