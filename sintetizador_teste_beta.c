@@ -29,12 +29,6 @@
 #define I2C_SCL 15
 #define SSD1306_I2C_FREQ 400000  // 400 kHz
 
-#define BAR_WIDTH 2
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define PAGE_COUNT (SCREEN_HEIGHT / 8)
-#define BUFFER_SIZE (SCREEN_WIDTH * PAGE_COUNT)
-
 uint8_t ssd[ssd1306_buffer_length];
 struct render_area frame_area = {
     .start_column = 0,
@@ -81,16 +75,6 @@ int main() {
     init_pwm_buzzer();
     init_buttons();
 
-    // Inicializa hardware e display
-    ssd1306_init();
-
-    // Exemplo de samples simulados (você deve substituir pela leitura real)
-    uint16_t samples[64];
-    for (int i = 0; i < 64; i++) {
-        // Para exemplo, vamos criar um gradiente de valores para teste
-        samples[i] = (i * 4095) / 63;
-    }
-
     while (true) {
         if (!recording && !playing) {
             if (!gpio_get(BUTTON_A)) {
@@ -117,13 +101,6 @@ int main() {
             blocks_ready = 0;  // Limpa flag para não desenhar o mesmo bloco várias vezes
         }
 
-         update_bars_basic(samples, 64, ssd1306_buffer);
-
-        // Atualiza display com o buffer novo
-        ssd1306_update(ssd1306_buffer);
-
-        // Delay simples (substitua pelo seu timer)
-        for (volatile int d = 0; d < 100000; d++);   
         sleep_ms(100);
     }
     return 0;
@@ -262,73 +239,66 @@ void oled_init() {
     gpio_pull_up(I2C_SCL);
 
     ssd1306_init();  // Função da biblioteca SSD1306 para inicializar o display
-
-
-    memset(ssd, 0xFF, ssd1306_buffer_length);  // Liga todos os pixels
-    render_on_display(ssd, &frame_area);
-    sleep_ms(2000);
-
-    memset(ssd, 0x00, ssd1306_buffer_length);  // Apaga tudo
-    draw_bar(ssd, 10, 64);                      // Desenha uma barra vertical máxima na coluna 10
-    render_on_display(ssd, &frame_area);
-
-    /*
+    
     // Limpa o buffer e acende todos os pixels (tela cheia)
     memset(ssd, 0xFF, ssd1306_buffer_length);
     render_on_display(ssd, &frame_area);
 
     // Após isso limpa a tela para ficar preta no início
     memset(ssd, 0x00, ssd1306_buffer_length);
+    render_on_display(ssd, &frame_area);
+}
+
+/// Desenha uma barra vertical em coluna 'x' com altura 'height' (pixels)
+void draw_bar(uint8_t *buffer, int x, int height) {
+    // Para cada página vertical (0 a 7, pois 64/8 = 8 páginas)
+    for (int page = 0; page < 8; page++) {
+        uint8_t byte = 0x00;
+
+        // Para cada bit do byte (cada linha da página)
+        for (int bit = 0; bit < 8; bit++) {
+            int y = page * 8 + bit;  // Posição vertical do pixel
+
+            // Se o pixel está dentro da altura da barra, acende o bit
+            if (y >= 64 - height) {
+                byte |= (1 << bit);
+            }
+        }
+        buffer[page * ssd1306_width + x] = byte;  // Define o byte completo da página na coluna x
+    }
+}
+
+// Desenha uma barra com largura 'width', chamando draw_bar para cada coluna
+void draw_bar_width(uint8_t *buffer, int x, int width, int height) {
+    for (int w = 0; w < width; w++) {
+        if (x + w < ssd1306_width) {
+            draw_bar(buffer, x + w, height);
+        }
+    }
+}
+
+// Atualiza o display desenhando barras para os samples de áudio
+void update_bars_display(uint16_t *samples, int num_samples) {
+    memset(ssd, 0x00, ssd1306_buffer_length);  // Limpa o buffer
+
+    int bar_width = 2;
+    int spacing = 1;
+    int step = bar_width + spacing;
+    int num_bars = ssd1306_width / step;
+
+    for (int i = 0; i < num_bars && i < num_samples; i++) {
+        uint16_t sample = samples[i];
+        // Centraliza o sample em zero, magnitude absoluta para altura
+        int32_t centered = (int32_t)sample - 2048;
+        int32_t magnitude = centered < 0 ? -centered : centered;
+
+        int height = (magnitude * 64) / 2048;
+        if (height > 64) height = 64;
+
+        int x = i * step;
+
+        draw_bar_width(ssd, x, bar_width, height);
+    }
 
     render_on_display(ssd, &frame_area);
-    */
-}
-
-
-// --- Buffer do display ---
-uint8_t ssd1306_buffer[BUFFER_SIZE];
-
-// --- Prototipos das funções do driver (implementadas no seu driver) ---
-void ssd1306_init(void);
-void ssd1306_update(uint8_t *buffer);
-
-// --- Funções para desenhar barras (igual do exemplo anterior) ---
-
-void clear_buffer(uint8_t *buffer) {
-    memset(buffer, 0x00, BUFFER_SIZE);
-}
-
-void draw_bar_simple(uint8_t *buffer, int x, int height) {
-    if (x < 0 || x + BAR_WIDTH > SCREEN_WIDTH) return;
-    if (height > SCREEN_HEIGHT) height = SCREEN_HEIGHT;
-    if (height < 0) height = 0;
-
-    int full_pages = height / 8;
-    int partial_bits = height % 8;
-
-    for (int w = 0; w < BAR_WIDTH; w++) {
-        int col = x + w;
-        for (int p = 0; p < PAGE_COUNT; p++) {
-            buffer[p * SCREEN_WIDTH + col] = 0x00;
-        }
-        for (int p = 0; p < full_pages; p++) {
-            buffer[p * SCREEN_WIDTH + col] = 0xFF;
-        }
-        if (partial_bits > 0 && full_pages < PAGE_COUNT) {
-            uint8_t bits = (1 << partial_bits) - 1;
-            buffer[full_pages * SCREEN_WIDTH + col] = bits;
-        }
-    }
-}
-
-void update_bars_basic(uint16_t *samples, int num_samples, uint8_t *buffer) {
-    clear_buffer(buffer);
-
-    int num_bars = SCREEN_WIDTH / BAR_WIDTH;
-    if (num_samples > num_bars) num_samples = num_bars;
-
-    for (int i = 0; i < num_samples; i++) {
-        int height = (samples[i] * SCREEN_HEIGHT) / 4095;
-        draw_bar_simple(buffer, i * BAR_WIDTH, height);
-    }
 }
